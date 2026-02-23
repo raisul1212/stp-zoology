@@ -3,30 +3,23 @@ STP (Short-Term Plasticity) Mixers for the Zoology Framework
 =============================================================
 
 Biologically-inspired short-term synaptic plasticity applied to
-transformer sequence mixing and state mixing (MLP).
+transformer sequence mixing.
 
-This file implements ALL STP approaches as drop-in replacements
-for Zoology's existing mixers:
-
-SEQUENCE MIXERS (replace attention):
+SEQUENCE MIXERS (drop-in replacements for attention):
   Approach A: STPAttention      - Pure STP recurrent attention
   Approach B: HybridSTPAttention - Softmax attention + parallel STP with learned gate
 
-STATE MIXERS (replace MLP):
-  Approach C: STPMLP            - MLP with plastic first-layer weights
-
-Each can be used independently or combined. For example:
-  - A only:     sequence_mixer=STPAttention, state_mixer=MLP
-  - B only:     sequence_mixer=HybridSTPAttention, state_mixer=MLP
-  - C only:     sequence_mixer=MHA, state_mixer=STPMLP
-  - A+C:        sequence_mixer=STPAttention, state_mixer=STPMLP
-  - B+C:        sequence_mixer=HybridSTPAttention, state_mixer=STPMLP
-
 Hardware mapping (FeFET devices):
   W_static     -> FeFET polarization (non-volatile, trained via backprop)
-  F(t)         -> NQS channel charge (volatile, evolves via plasticity)
+  S(t)         -> NQS channel charge (volatile, evolves via plasticity)
   Lambda       -> Overlap capacitance (controls charge decay rate)
   Gamma        -> Coupling strength (controls update magnitude)
+
+Memory optimization:
+  Uses gradient checkpointing on the recurrent loop to avoid storing
+  all intermediate states. Sequences are processed in chunks of size
+  CHUNK_SIZE; only chunk boundaries are stored for backward pass.
+  This reduces memory from O(L * d^2) to O(CHUNK_SIZE * d^2).
 
 References:
   Rodriguez et al., "Short-Term Plasticity Networks" (2024)
@@ -40,7 +33,54 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from einops import rearrange
+
+
+# Default chunk size for gradient checkpointing.
+# Smaller = less memory, more recomputation.
+# 64 is a good balance for seq_len up to 1024.
+DEFAULT_CHUNK_SIZE = 64
+
+
+def _stp_recurrence_chunk(q_chunk, k_chunk, v_chunk, state, W_static, retention, gamma):
+    """
+    Process a chunk of timesteps through the STP recurrence.
+    
+    Args:
+        q_chunk: (B, H, C, d) — queries for this chunk
+        k_chunk: (B, H, C, d) — keys for this chunk
+        v_chunk: (B, H, C, d) — values for this chunk
+        state:   (B, H, d, d) — recurrent state at chunk start
+        W_static: (H, d, d)   — static weight matrix
+        retention: (H, d, d)  — 1 - Lambda (decay complement)
+        gamma:   (H, d, d)    — Hebbian learning rate
+    
+    Returns:
+        outputs: (B, H, C, d) — output for this chunk
+        state:   (B, H, d, d) — recurrent state at chunk end
+    """
+    B, H, C, d = q_chunk.shape
+    outputs = []
+
+    for t in range(C):
+        k_t = k_chunk[:, :, t, :]  # (B, H, d)
+        v_t = v_chunk[:, :, t, :]  # (B, H, d)
+        q_t = q_chunk[:, :, t, :]  # (B, H, d)
+
+        # Hebbian outer product: v_t (x) k_t
+        hebbian = torch.einsum("bhi,bhj->bhij", v_t, k_t)  # (B, H, d, d)
+
+        # State update: decay + learn
+        state = retention.unsqueeze(0) * state + gamma.unsqueeze(0) * hebbian
+
+        # Output: (W_static + S(t)) @ q_t
+        effective_W = W_static.unsqueeze(0) + state
+        y_t = torch.einsum("bhij,bhj->bhi", effective_W, q_t)  # (B, H, d)
+        outputs.append(y_t)
+
+    outputs = torch.stack(outputs, dim=2)  # (B, H, C, d)
+    return outputs, state
 
 
 # ==============================================================================
@@ -59,20 +99,21 @@ class STPAttention(nn.Module):
     Lambda and Gamma are per-element learned parameters, enabling the model
     to selectively retain or forget different associations at different rates.
 
-    This is a linear-time recurrent model (no quadratic attention matrix).
+    Uses gradient checkpointing to handle long sequences without OOM.
 
     Usage in Zoology config:
         sequence_mixer=ModuleConfig(
             name="zoology.mixers.stp.STPAttention",
-            kwargs={"num_heads": 1}
+            kwargs={"num_heads": 2}
         )
     """
 
     def __init__(
         self,
         d_model: int,
-        num_heads: int = 1,
+        num_heads: int = 2,
         bias: bool = True,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
         layer_idx: int = None,
         **kwargs,
     ):
@@ -80,6 +121,7 @@ class STPAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.chunk_size = chunk_size
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
 
         # QKV projections
@@ -132,32 +174,37 @@ class STPAttention(nn.Module):
         # Normalize keys
         k = k * self.scale
 
-        # STP recurrence
-        lam = self.Lambda  # (H, d, d)
-        retention = 1.0 - lam
+        # STP parameters
+        retention = 1.0 - self.Lambda  # (H, d, d)
         gamma = self.Gamma  # (H, d, d)
 
-        # State: (B, H, d, d)
+        # Process in chunks with gradient checkpointing
         state = torch.zeros(B, H, d, d, device=x.device, dtype=x.dtype)
+        all_outputs = []
 
-        outputs = []
-        for t in range(L):
-            k_t = k[:, :, t, :]  # (B, H, d)
-            v_t = v[:, :, t, :]  # (B, H, d)
-            q_t = q[:, :, t, :]  # (B, H, d)
+        for start in range(0, L, self.chunk_size):
+            end = min(start + self.chunk_size, L)
+            q_chunk = q[:, :, start:end, :]
+            k_chunk = k[:, :, start:end, :]
+            v_chunk = v[:, :, start:end, :]
 
-            # Hebbian outer product: v_t (x) k_t
-            hebbian = torch.einsum("bhi,bhj->bhij", v_t, k_t)  # (B, H, d, d)
+            if self.training:
+                # Gradient checkpointing: recompute forward during backward
+                chunk_out, state = checkpoint(
+                    _stp_recurrence_chunk,
+                    q_chunk, k_chunk, v_chunk, state,
+                    self.W_static, retention, gamma,
+                    use_reentrant=False,
+                )
+            else:
+                chunk_out, state = _stp_recurrence_chunk(
+                    q_chunk, k_chunk, v_chunk, state,
+                    self.W_static, retention, gamma,
+                )
 
-            # State update: decay + learn
-            state = retention.unsqueeze(0) * state + gamma.unsqueeze(0) * hebbian
+            all_outputs.append(chunk_out)
 
-            # Output: (W_static + S(t)) @ q_t
-            effective_W = self.W_static.unsqueeze(0) + state  # (B, H, d, d)
-            y_t = torch.einsum("bhij,bhj->bhi", effective_W, q_t)  # (B, H, d)
-            outputs.append(y_t)
-
-        y = torch.stack(outputs, dim=2)  # (B, H, L, d)
+        y = torch.cat(all_outputs, dim=2)  # (B, H, L, d)
         y = rearrange(y, "b h l d -> b l (h d)")
         y = self.out_proj(y)
         return y
@@ -179,22 +226,22 @@ class HybridSTPAttention(nn.Module):
     The gate alpha is learned per-position, allowing the model to decide
     WHEN to use precise recall (softmax) vs adaptive memory (STP).
 
-    This is the most practical approach for augmenting existing transformers:
-    add an STP branch and learn when to use it.
+    Uses gradient checkpointing for the STP branch.
 
     Usage in Zoology config:
         sequence_mixer=ModuleConfig(
             name="zoology.mixers.stp.HybridSTPAttention",
-            kwargs={"num_heads": 1}
+            kwargs={"num_heads": 2}
         )
     """
 
     def __init__(
         self,
         d_model: int,
-        num_heads: int = 1,
+        num_heads: int = 2,
         bias: bool = True,
         dropout: float = 0.0,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
         layer_idx: int = None,
         **kwargs,
     ):
@@ -202,6 +249,7 @@ class HybridSTPAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.chunk_size = chunk_size
         assert d_model % num_heads == 0
 
         # Shared QKV projections
@@ -268,28 +316,36 @@ class HybridSTPAttention(nn.Module):
         )
         y_softmax = torch.einsum("bhij,bhjd->bhid", attn_weights, v)  # (B,H,L,d)
 
-        # === STP branch (recurrent) ===
+        # === STP branch (recurrent with checkpointing) ===
         k_stp = k * self.scale  # normalized keys for STP
-        lam = self.Lambda
-        retention = 1.0 - lam
+        retention = 1.0 - self.Lambda
         gamma = self.Gamma
 
         state = torch.zeros(B, H, d, d, device=x.device, dtype=x.dtype)
         stp_outputs = []
 
-        for t in range(L):
-            k_t = k_stp[:, :, t, :]
-            v_t = v[:, :, t, :]
-            q_t = q[:, :, t, :]
+        for start in range(0, L, self.chunk_size):
+            end = min(start + self.chunk_size, L)
+            q_chunk = q[:, :, start:end, :]
+            k_chunk = k_stp[:, :, start:end, :]
+            v_chunk = v[:, :, start:end, :]
 
-            hebbian = torch.einsum("bhi,bhj->bhij", v_t, k_t)
-            state = retention.unsqueeze(0) * state + gamma.unsqueeze(0) * hebbian
+            if self.training:
+                chunk_out, state = checkpoint(
+                    _stp_recurrence_chunk,
+                    q_chunk, k_chunk, v_chunk, state,
+                    self.W_static, retention, gamma,
+                    use_reentrant=False,
+                )
+            else:
+                chunk_out, state = _stp_recurrence_chunk(
+                    q_chunk, k_chunk, v_chunk, state,
+                    self.W_static, retention, gamma,
+                )
 
-            effective_W = self.W_static.unsqueeze(0) + state
-            y_t = torch.einsum("bhij,bhj->bhi", effective_W, q_t)
-            stp_outputs.append(y_t)
+            stp_outputs.append(chunk_out)
 
-        y_stp = torch.stack(stp_outputs, dim=2)  # (B, H, L, d)
+        y_stp = torch.cat(stp_outputs, dim=2)  # (B, H, L, d)
 
         # === Learned gate ===
         alpha = self.gate_proj(x)  # (B, L, H)
@@ -303,7 +359,6 @@ class HybridSTPAttention(nn.Module):
         return y
 
     def state_size(self, sequence_length: int = 2048):
-        # Softmax stores full KV cache; STP stores d*d state per head
         return (
             2 * self.d_model * sequence_length
             + self.num_heads * self.head_dim * self.head_dim
@@ -311,7 +366,7 @@ class HybridSTPAttention(nn.Module):
 
 
 # ==============================================================================
-# Approach C: STP-MLP (State Mixer)
+# Approach C: STP-MLP (State Mixer) — for future experiments
 # ==============================================================================
 
 class STPMLP(nn.Module):
@@ -323,31 +378,30 @@ class STPMLP(nn.Module):
         F(t) = (1 - Lambda_F) * F(t-1) + Gamma_F * outer(h_prev, x_t)
         h = GELU(G(t) @ x_t + b1) @ W2 + b2
 
-    This makes the "knowledge" stored in the FFN context-adaptive.
+    Uses gradient checkpointing to handle long sequences.
 
-    Hardware mapping:
-        W1       -> FeFET polarization (non-volatile)
-        F(t)     -> NQS channel charge (volatile)
-        Lambda_F -> Overlap capacitance
-        Gamma_F  -> Coupling strength
+    NOT used in the current MQAR experiment (original benchmark has no MLP).
+    Reserved for future experiments where MLP is part of the architecture.
 
     Usage in Zoology config:
         state_mixer=ModuleConfig(
             name="zoology.mixers.stp.STPMLP",
-            kwargs={"hidden_mult": 4}
+            kwargs={"hidden_mult": 2}
         )
     """
 
     def __init__(
         self,
         d_model: int,
-        hidden_mult: int = 4,
+        hidden_mult: int = 2,
         activation: str = "gelu",
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
         layer_idx: int = None,
         **kwargs,
     ):
         super().__init__()
         self.d_model = d_model
+        self.chunk_size = chunk_size
         d_ff = d_model * hidden_mult
 
         # Standard MLP weights
@@ -376,184 +430,49 @@ class STPMLP(nn.Module):
     def Lambda_F(self):
         return torch.sigmoid(self.Lambda_raw_F)
 
-    def forward(self, x: torch.Tensor, **kwargs):
-        """
-        x: (B, L, D)
-        Returns: (B, L, D)
-        """
-        B, L, D = x.shape
-
-        lam = self.Lambda_F  # (d_ff, d_model)
+    def _forward_chunk(self, x_chunk, F_state):
+        """Process a chunk of timesteps."""
+        B, C, D = x_chunk.shape
+        lam = self.Lambda_F
         retention = 1.0 - lam
-        gamma = self.Gamma_F  # (d_ff, d_model)
-        W1 = self.fc1.weight  # (d_ff, d_model)
-        b1 = self.fc1.bias  # (d_ff,)
-
-        # Plastic state: (B, d_ff, d_model)
-        F_state = torch.zeros(B, W1.shape[0], W1.shape[1],
-                              device=x.device, dtype=x.dtype)
+        gamma = self.Gamma_F
+        W1 = self.fc1.weight
+        b1 = self.fc1.bias
 
         outputs = []
-        for t in range(L):
-            x_t = x[:, t, :]  # (B, d_model)
-
-            # Effective weight = static + plastic
-            G = W1.unsqueeze(0) + F_state  # (B, d_ff, d_model)
-
-            # Forward through plastic first layer
-            h = torch.einsum("bij,bj->bi", G, x_t)  # (B, d_ff)
+        for t in range(C):
+            x_t = x_chunk[:, t, :]
+            G = W1.unsqueeze(0) + F_state
+            h = torch.einsum("bij,bj->bi", G, x_t)
             if b1 is not None:
                 h = h + b1
-
-            h_pre = h  # Save pre-activation for Hebbian update
+            h_pre = h
             h = self.activation(h)
-
-            # Second layer (standard)
-            out = self.fc2(h)  # (B, d_model)
+            out = self.fc2(h)
             outputs.append(out)
-
-            # Hebbian update for NEXT timestep
-            hebbian = torch.einsum("bi,bj->bij", h_pre, x_t)  # (B, d_ff, d_model)
+            hebbian = torch.einsum("bi,bj->bij", h_pre, x_t)
             F_state = retention.unsqueeze(0) * F_state + gamma.unsqueeze(0) * hebbian
 
-        y = torch.stack(outputs, dim=1)  # (B, L, D)
-        return y
-
-
-# ==============================================================================
-# Standard baselines for fair comparison
-# ==============================================================================
-
-class LinearAttention(nn.Module):
-    """
-    Simple linear attention baseline (no decay, no plasticity).
-    S(t) = S(t-1) + v_t @ k_t^T  (pure accumulation)
-    y(t) = S(t) @ q_t
-
-    Usage in Zoology config:
-        sequence_mixer=ModuleConfig(
-            name="zoology.mixers.stp.LinearAttention",
-            kwargs={"num_heads": 1}
-        )
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        num_heads: int = 1,
-        bias: bool = True,
-        layer_idx: int = None,
-        **kwargs,
-    ):
-        super().__init__()
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        assert d_model % num_heads == 0
-
-        self.Wqkv = nn.Linear(d_model, 3 * d_model, bias=bias)
-        self.out_proj = nn.Linear(d_model, d_model, bias=bias)
-        self.scale = 1.0 / math.sqrt(self.head_dim)
+        return torch.stack(outputs, dim=1), F_state
 
     def forward(self, x: torch.Tensor, **kwargs):
         B, L, D = x.shape
-        H = self.num_heads
-        d = self.head_dim
+        F_state = torch.zeros(B, self.fc1.weight.shape[0], self.fc1.weight.shape[1],
+                              device=x.device, dtype=x.dtype)
 
-        qkv = self.Wqkv(x)
-        qkv = rearrange(qkv, "b l (three h d) -> three b h l d", three=3, h=H)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        all_outputs = []
+        for start in range(0, L, self.chunk_size):
+            end = min(start + self.chunk_size, L)
+            x_chunk = x[:, start:end, :]
 
-        k = k * self.scale
-        state = torch.zeros(B, H, d, d, device=x.device, dtype=x.dtype)
+            if self.training:
+                chunk_out, F_state = checkpoint(
+                    self._forward_chunk, x_chunk, F_state,
+                    use_reentrant=False,
+                )
+            else:
+                chunk_out, F_state = self._forward_chunk(x_chunk, F_state)
 
-        outputs = []
-        for t in range(L):
-            k_t = k[:, :, t, :]
-            v_t = v[:, :, t, :]
-            q_t = q[:, :, t, :]
+            all_outputs.append(chunk_out)
 
-            state = state + torch.einsum("bhi,bhj->bhij", v_t, k_t)
-            y_t = torch.einsum("bhij,bhj->bhi", state, q_t)
-            outputs.append(y_t)
-
-        y = torch.stack(outputs, dim=2)
-        y = rearrange(y, "b h l d -> b l (h d)")
-        y = self.out_proj(y)
-        return y
-
-    def state_size(self, sequence_length: int = 2048):
-        return self.num_heads * self.head_dim * self.head_dim
-
-
-class RetNetAttention(nn.Module):
-    """
-    RetNet-style attention baseline (scalar decay, no per-element plasticity).
-    S(t) = gamma * S(t-1) + v_t @ k_t^T
-    y(t) = S(t) @ q_t
-
-    Usage in Zoology config:
-        sequence_mixer=ModuleConfig(
-            name="zoology.mixers.stp.RetNetAttention",
-            kwargs={"num_heads": 1}
-        )
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        num_heads: int = 1,
-        bias: bool = True,
-        layer_idx: int = None,
-        **kwargs,
-    ):
-        super().__init__()
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        assert d_model % num_heads == 0
-
-        self.Wqkv = nn.Linear(d_model, 3 * d_model, bias=bias)
-        self.out_proj = nn.Linear(d_model, d_model, bias=bias)
-        self.scale = 1.0 / math.sqrt(self.head_dim)
-
-        # One scalar decay per head (learned)
-        self.gamma_raw = nn.Parameter(torch.zeros(num_heads))
-        nn.init.uniform_(self.gamma_raw, 0.0, 2.0)
-
-    @property
-    def gamma(self):
-        return torch.sigmoid(self.gamma_raw)
-
-    def forward(self, x: torch.Tensor, **kwargs):
-        B, L, D = x.shape
-        H = self.num_heads
-        d = self.head_dim
-
-        qkv = self.Wqkv(x)
-        qkv = rearrange(qkv, "b l (three h d) -> three b h l d", three=3, h=H)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        k = k * self.scale
-        g = self.gamma  # (H,)
-        state = torch.zeros(B, H, d, d, device=x.device, dtype=x.dtype)
-
-        outputs = []
-        for t in range(L):
-            k_t = k[:, :, t, :]
-            v_t = v[:, :, t, :]
-            q_t = q[:, :, t, :]
-
-            state = g.view(1, H, 1, 1) * state + torch.einsum(
-                "bhi,bhj->bhij", v_t, k_t
-            )
-            y_t = torch.einsum("bhij,bhj->bhi", state, q_t)
-            outputs.append(y_t)
-
-        y = torch.stack(outputs, dim=2)
-        y = rearrange(y, "b h l d -> b l (h d)")
-        y = self.out_proj(y)
-        return y
-
-    def state_size(self, sequence_length: int = 2048):
-        return self.num_heads * self.head_dim * self.head_dim
+        return torch.cat(all_outputs, dim=1)
